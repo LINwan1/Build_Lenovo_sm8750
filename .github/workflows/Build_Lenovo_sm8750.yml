@@ -474,7 +474,10 @@ jobs:
         if: ${{ env.ENABLE_SUSFS == 'true' }}
         run: |
           cd kernel_workspace
-          git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android15-6.6
+          # 钉到 383616f (2026-09-07, 新增 fs/exec.c 直接调用 ksu_install_su_fd) 之前的最后一个提交,
+          # 该提交后的补丁要求新版 ReSukiSU 驱动 (含 ksu_install_su_fd), 与上方钉定的 a13d71f6 旧驱动不兼容
+          git clone https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android15-6.6
+          cd susfs4ksu && git checkout df8f104a1f37c3b376663e256907193051d59f4e && cd ..
           wget https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
           cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common/
           cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
