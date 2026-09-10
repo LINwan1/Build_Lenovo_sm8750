@@ -463,9 +463,11 @@ jobs:
         run: |
           cd kernel_workspace
           echo "正在配置ReSukiSU..."
-          # 锁定到 ReSukiSU 移除 KPM 前的最后一个提交 (PR #226 前, 2026-06-05), 以保留 KPM 支持
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s a13d71f699093f0c1da7ba442881eccaa8e4321a
-          cd ./KernelSU 
+          # 使用 ReSukiSU main 分支 (含 ksu_install_su_fd, 兼容 2026-09-07 后的最新 SUSFS 补丁)
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s 246d3e52e667cb72ce8f70c93b70d3b42b100b76
+          # 还原被上游 PR #226 移除的 KPM 内核支持 (补丁基于 246d3e5 生成, 含 ksu_is_allow_uid_for_current 改名适配)
+          cd ./KernelSU
+          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/patch/resukisu_restore_kpm.patch"
           KSU_VERSION=$(expr $(git rev-list --count HEAD 2>/dev/null) + 30700 2>/dev/null || echo 114514)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
@@ -474,10 +476,8 @@ jobs:
         if: ${{ env.ENABLE_SUSFS == 'true' }}
         run: |
           cd kernel_workspace
-          # 钉到 383616f (2026-09-07, 新增 fs/exec.c 直接调用 ksu_install_su_fd) 之前的最后一个提交,
-          # 该提交后的补丁要求新版 ReSukiSU 驱动 (含 ksu_install_su_fd), 与上方钉定的 a13d71f6 旧驱动不兼容
-          git clone https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android15-6.6
-          cd susfs4ksu && git checkout df8f104a1f37c3b376663e256907193051d59f4e && cd ..
+          # ReSukiSU 已钉定到 246d3e5 (含 ksu_install_su_fd), 与最新 SUSFS 补丁兼容, 此处保持拉取最新补丁
+          git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android15-6.6
           wget https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
           cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common/
           cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
