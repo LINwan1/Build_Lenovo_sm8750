@@ -41,7 +41,7 @@ on:
       enable_ReKernel:
         description: "启用Re-Kernel支持"
         required: false
-        default: true
+        default: false
         type: boolean
       
       enable_Adios:
