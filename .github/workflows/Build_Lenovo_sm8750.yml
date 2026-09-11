@@ -1,6 +1,6 @@
 name: Build_Lenovo_sm8750
 permissions:
-  contents: read
+  contents: write
   actions: write
 on:
   workflow_dispatch:
@@ -62,6 +62,12 @@ on:
         default: true
         type: boolean
 
+      enable_release:
+        description: "🚀 发布本次构建产物到 Releases"
+        required: false
+        default: false
+        type: boolean
+
       enable_zw_fix:
         description: "应用Unicode零宽绕过修复补丁(CVE-2024-43093/CVE-2024-50089)"
         required: false
@@ -85,6 +91,7 @@ jobs:
       ENABLE_DROIDSPACES: ${{ github.event.inputs.enable_droidspaces }}
       ENABLE_BBG: ${{ github.event.inputs.enable_bbg }}
       ENABLE_SIGNED: ${{ github.event.inputs.enable_signed }}
+      ENABLE_RELEASE: ${{ github.event.inputs.enable_release }}
       ENABLE_ZW_FIX: ${{ github.event.inputs.enable_zw_fix }}
     steps:
       - uses: actions/checkout@v5
@@ -818,6 +825,39 @@ jobs:
         with:
          name: Boot_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_ReSukiSU_AOSP_Signed
          path: kernel_workspace/boot_avb_tool/AOSP-Testkey-BootSigner-main/boot.img
+
+      - name: 🚀 Publish to Releases (发布到 Releases)
+        if: ${{ env.ENABLE_RELEASE == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "正在收集发布文件..."
+          mkdir -p release_files
+          # 内核 Image
+          cp kernel_workspace/common/out/arch/arm64/boot/kernel "release_files/kernel_${{ env.KERNEL_VERSION }}_${{ env.KSUVER }}"
+          # 已签名的 boot (若启用)
+          if [ -f kernel_workspace/boot_avb_tool/AOSP-Testkey-BootSigner-main/boot.img ]; then
+            cp kernel_workspace/boot_avb_tool/AOSP-Testkey-BootSigner-main/boot.img "release_files/Boot_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_ReSukiSU_AOSP_Signed.img"
+          fi
+          # ReSukiSU 管理器 (若启用)
+          if compgen -G "/tmp/manager/*.apk" > /dev/null; then
+            cp /tmp/manager/*.apk release_files/
+          fi
+          ls -lah release_files/
+          TAG="${{ env.KERNEL_VERSION }}-ReSukiSU-r${{ env.KSUVER }}-$(date +%Y%m%d-%H%M%S)"
+          NOTES="$(mktemp)"
+          {
+            echo "## 自动构建内核"
+            echo ""
+            echo "- **内核版本**: ${{ env.KERNEL_VERSION }}"
+            echo "- **ReSukiSU**: r${{ env.KSUVER }}"
+            echo "- **构建时间**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **触发者**: @${{ github.actor }}"
+          } > "$NOTES"
+          echo "正在创建 Release: $TAG"
+          gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" release_files/*
+          echo "✅ 已发布到 Releases"
 
   upload_rekernel:
     name: Upload Re-Kernel Module
