@@ -12,7 +12,7 @@
 
 ## 📖 项目简介
 
-本项目提供基于 **GitHub Actions** 的自动化内核编译工作流，支持 **Lenovo** 搭载 **SM8750** 平台的设备。通过高度集成的脚本，实现一键编译包含 **(Re)SukiSU**、**SUSFS**、**ADIOS调度** 等功能的 GKI 内核。
+本项目提供基于 **GitHub Actions** 的自动化内核编译工作流，支持 **Lenovo** 搭载 **SM8750** 平台的设备。通过高度集成的脚本，实现一键编译包含 **(Re)SukiSU**、**ADIOS调度** 等功能的 GKI 内核。
 
 ### ✨ 主要特性
 
@@ -46,7 +46,7 @@
 
 | 工作流 | 说明 | 适用场景 |
 |--------|------|----------|
-| [build.yml](.github/workflows/build.yml) | 完整内核编译（含 KSU/SUSFS 等） | 集成KSU获取ROOT |
+| [build.yml](.github/workflows/build.yml) | 完整内核编译（含 KSU 等） | 集成KSU获取ROOT |
 | [clean-caches.yml](.github/workflows/clean-caches.yml) | 清理 ccache 缓存 | 缓存异常或需要重新编译时 |
 | [clear_workflows.yml](.github/workflows/clear_workflows.yml) | 清理工作流运行记录 | 保证Action界面整洁
 
@@ -60,7 +60,6 @@
 
 - **kernel_version**: 选择要编译的内核版本
 - **KSU Type**: 选择 KernelSU 类型 (ReSukiSU / SukiSU-Ultra)
-- **Enable SUSFS**: 是否启用 SUSFS 支持
 - **Custom Flags**: 添加额外的编译标志
 
 #### 使用公共缓存
