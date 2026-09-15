@@ -488,6 +488,28 @@ jobs:
               || { echo "::error::kernel/Kbuild 未引用 CONFIG_KPM"; exit 1; }
             echo "  ✓ KPM 内核态代码齐全 (a13d71f6)"
           fi
+      - name: 🔧 Install native KPM loader (安装原生 KPM 加载器)
+        if: ${{ env.ENABLE_KPM == 'true' }}
+        run: |
+          cd kernel_workspace/KernelSU
+          echo "==> 用 743ddce9f7 的原生 KPM 加载器替换 a13d71f6 的桩实现"
+          cp -v "$GITHUB_WORKSPACE/kpm_native/kpm.c"     kernel/kpm/kpm.c
+          cp -v "$GITHUB_WORKSPACE/kpm_native/kpm.h"     kernel/kpm/kpm.h
+          cp -v "$GITHUB_WORKSPACE/kpm_native/compact.c" kernel/kpm/compact.c
+          cp -v "$GITHUB_WORKSPACE/kpm_native/compact.h" kernel/kpm/compact.h
+          echo "--- 校验 ---"
+          if grep -q "Stub function" kernel/kpm/kpm.c; then
+            echo "::error::kpm.c 仍含桩代码"
+            exit 1
+          fi
+          grep -q "KSU_KPM_LOAD" kernel/kpm/kpm.c \
+            || { echo "::error::kpm.c 缺 ioctl 适配层"; exit 1; }
+          grep -q "kpm_apply_relocate_arm64" kernel/kpm/kpm.c \
+            || { echo "::error::kpm.c 缺 ARM64 重定位实现"; exit 1; }
+          grep -q "sukisu_compact_find_symbol" kernel/kpm/compact.c \
+            || { echo "::error::compact.c 缺符号解析"; exit 1; }
+          echo "  ✓ 原生 KPM 加载器已就位 (ELF + ARM64 重定位)"
+
 
       - name: 🔧 Apply Droidspaces SYSVIPC kABI fix (应用 Droidspaces SYSVIPC kABI 修复)
         if: ${{ env.ENABLE_DROIDSPACES == 'true' }}
