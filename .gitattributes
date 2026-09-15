@@ -1,0 +1,6 @@
+# 补丁与工作流必须保持 LF —— Actions 里的 git apply / patch -p1 对行尾敏感
+* text=auto eol=lf
+*.patch text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
