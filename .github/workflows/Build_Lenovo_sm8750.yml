@@ -44,6 +44,12 @@ on:
         default: false
         type: boolean
       
+      enable_kpm:
+        description: "启用KPM内核态支持 (原生，需 pin=a13d71f6)"
+        required: false
+        default: true
+        type: boolean
+
       enable_Adios:
         description: "启用ADIOS IO调度器支持"
         required: true
@@ -90,6 +96,7 @@ jobs:
       ENABLE_ADIOS: ${{ github.event.inputs.enable_Adios }}
       ENABLE_DROIDSPACES: ${{ github.event.inputs.enable_droidspaces }}
       ENABLE_BBG: ${{ github.event.inputs.enable_bbg }}
+      ENABLE_KPM: ${{ github.event.inputs.enable_kpm }}
       ENABLE_SIGNED: ${{ github.event.inputs.enable_signed }}
       ENABLE_RELEASE: ${{ github.event.inputs.enable_release }}
       ENABLE_ZW_FIX: ${{ github.event.inputs.enable_zw_fix }}
@@ -456,12 +463,31 @@ jobs:
         run: |
           cd kernel_workspace
           echo "正在配置ReSukiSU..."
-          # 钉定 ReSukiSU main 分支 052ca27
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s 052ca27775cc9c8570e3b1ba3db7c29486d6020e
+          # 钉定 ReSukiSU a13d71f6 —— 最后一个原生支持 KPM 的提交（内核+ksud+管理器三层齐全）
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s a13d71f699093f0c1da7ba442881eccaa8e4321a
           cd ./KernelSU
           KSU_VERSION=$(expr $(git rev-list --count HEAD 2>/dev/null) + 30700 2>/dev/null || echo 114514)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+          # --- KPM 内核态校验：防止 setup.sh 静默回落到 main 分支 ---
+          if [ "${{ env.ENABLE_KPM }}" = "true" ]; then
+            ACTUAL_SHA=$(git rev-parse HEAD)
+            echo "== 校验 KPM 内核态支持 =="
+            echo "   实际 ReSukiSU commit: $ACTUAL_SHA"
+            if [ "$ACTUAL_SHA" != "a13d71f699093f0c1da7ba442881eccaa8e4321a" ]; then
+              echo "::error::ReSukiSU commit 不是 a13d71f6（实际 $ACTUAL_SHA）—— checkout 失败回落到默认分支"
+              exit 1
+            fi
+            test -f kernel/kpm/kpm.c \
+              || { echo "::error::kernel/kpm/kpm.c 缺失，KPM 内核态代码不存在"; exit 1; }
+            test -f kernel/kpm/super_access.c \
+              || { echo "::error::kernel/kpm/super_access.c 缺失"; exit 1; }
+            grep -q 'config KPM' kernel/Kconfig \
+              || { echo "::error::kernel/Kconfig 缺少 config KPM"; exit 1; }
+            grep -q 'CONFIG_KPM' kernel/Kbuild \
+              || { echo "::error::kernel/Kbuild 未引用 CONFIG_KPM"; exit 1; }
+            echo "  ✓ KPM 内核态代码齐全 (a13d71f6)"
+          fi
 
       - name: 🔧 Apply Droidspaces SYSVIPC kABI fix (应用 Droidspaces SYSVIPC kABI 修复)
         if: ${{ env.ENABLE_DROIDSPACES == 'true' }}
@@ -604,6 +630,11 @@ jobs:
 
           # ==================== KSU 配置 ====================
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          # --- KPM (SukiSU Kernel Patch Module) ---
+          if [ "${{ env.ENABLE_KPM }}" = "true" ]; then
+            echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+            echo "  ✓ 已启用 CONFIG_KPM=y"
+          fi
 
           echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%-Re-TG@qdykernel"' >> "$DEFCONFIG"
 
