@@ -1,0 +1,890 @@
+diff --git a/kernel/Kbuild b/kernel/Kbuild
+index a990e9b..e3944e8 100644
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -36,6 +36,12 @@ kernelsu-objs += supercall/dispatch.o
+ kernelsu-objs += supercall/perm.o
+ kernelsu-objs += supercall/supercall.o
+ 
++ifdef CONFIG_KPM
++kernelsu-objs += kpm/kpm.o
++kernelsu-objs += kpm/compact.o
++kernelsu-objs += kpm/super_access.o
++endif
++
+ ifdef CONFIG_ARM64
+ kernelsu-objs += compat/apatch_conflict.o
+ endif
+@@ -194,6 +200,14 @@ else
+   endif
+ endif
+ 
++# Check if KPM is enabled
++ifdef CONFIG_KPM
++  $(info -- KPM is enabled)
++  $(info -- WARNING, This feature is unstable!!! You are WARNED!!!)
++else
++  $(info -- KPM is disabled)
++endif
++
+ ifndef CONFIG_KSU_TRACEPOINT_HOOK
+   # For old kernel, pkg observer maybe let system freeze
+   # https://github.com/ReSukiSU/ReSukiSU/issues/82#issuecomment-4015396974
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 0174d2d..69e0ad5 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -77,6 +77,17 @@ config KSU_MULTI_MANAGER_SUPPORT
+ 	help
+ 		Enable multi KernelSU manager support
+ 
++config KPM
++    bool "Enable SukiSU KPM"
++    depends on KSU && 64BIT
++    select KALLSYMS
++    select KALLSYMS_ALL
++    default n
++    help
++	  Enabling this option will activate the KPM feature of SukiSU.
++	  This option is suitable for scenarios where you need to force KPM to be enabled.
++	  but it may affect system stability.
++
+ choice
+ 	prompt "KernelSU Hooking Method"
+ 	depends on KSU
+diff --git a/kernel/kpm/compact.c b/kernel/kpm/compact.c
+new file mode 100644
+index 0000000..37eae37
+--- /dev/null
++++ b/kernel/kpm/compact.c
+@@ -0,0 +1,87 @@
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/kernfs.h>
++#include <linux/file.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/uaccess.h>
++#include <linux/elf.h>
++#include <linux/kallsyms.h>
++#include <linux/version.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/rcupdate.h>
++#include <asm/elf.h>
++#include <linux/vmalloc.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <asm/cacheflush.h>
++#include <linux/module.h>
++#include <linux/vmalloc.h>
++#include <linux/set_memory.h>
++#include <linux/version.h>
++#include <linux/export.h>
++#include <linux/slab.h>
++#include "kpm.h"
++#include "compact.h"
++#include "policy/allowlist.h"
++#include "manager/manager_identity.h"
++
++static int sukisu_is_su_allow_uid(uid_t uid)
++{
++    return __ksu_is_allow_uid_for_current(uid) ? 1 : 0;
++}
++
++static int sukisu_get_ap_mod_exclude(uid_t uid)
++{
++    return 0; /* Not supported */
++}
++
++static int sukisu_is_uid_should_umount(uid_t uid)
++{
++    return ksu_uid_should_umount(uid) ? 1 : 0;
++}
++
++static int sukisu_is_current_uid_manager(void)
++{
++    return is_manager();
++}
++
++struct CompactAddressSymbol {
++    const char *symbol_name;
++    void *addr;
++};
++
++unsigned long sukisu_compact_find_symbol(const char *name);
++
++static struct CompactAddressSymbol address_symbol[] = {
++    { "kallsyms_lookup_name", &kallsyms_lookup_name },
++    { "compact_find_symbol", &sukisu_compact_find_symbol },
++    { "is_run_in_sukisu_ultra", (void *)1 },
++    { "is_su_allow_uid", &sukisu_is_su_allow_uid },
++    { "get_ap_mod_exclude", &sukisu_get_ap_mod_exclude },
++    { "is_uid_should_umount", &sukisu_is_uid_should_umount },
++    { "is_current_uid_manager", &sukisu_is_current_uid_manager },
++};
++
++unsigned long sukisu_compact_find_symbol(const char *name)
++{
++    int i;
++    unsigned long addr;
++
++    for (i = 0; i < (sizeof(address_symbol) / sizeof(struct CompactAddressSymbol)); i++) {
++        struct CompactAddressSymbol *symbol = &address_symbol[i];
++
++        if (strcmp(name, symbol->symbol_name) == 0)
++            return (unsigned long)symbol->addr;
++    }
++
++    addr = kallsyms_lookup_name(name);
++    if (addr)
++        return addr;
++
++    return 0;
++}
++EXPORT_SYMBOL(sukisu_compact_find_symbol);
+diff --git a/kernel/kpm/compact.h b/kernel/kpm/compact.h
+new file mode 100644
+index 0000000..c9f69dc
+--- /dev/null
++++ b/kernel/kpm/compact.h
+@@ -0,0 +1,6 @@
++#ifndef __SUKISU_KPM_COMPACT_H
++#define __SUKISU_KPM_COMPACT_H
++
++extern unsigned long sukisu_compact_find_symbol(const char *name);
++
++#endif
+diff --git a/kernel/kpm/kpm.c b/kernel/kpm/kpm.c
+new file mode 100644
+index 0000000..7e30742
+--- /dev/null
++++ b/kernel/kpm/kpm.c
+@@ -0,0 +1,284 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* 
++ * Copyright (C) 2025 Liankong (xhsw.new@outlook.com). All Rights Reserved.
++ * 本代码由GPL-2授权
++ * 
++ * 适配KernelSU的KPM 内核模块加载器兼容实现
++ * 
++ * 集成了 ELF 解析、内存布局、符号处理、重定位（支持 ARM64 重定位类型）
++ * 并参照KernelPatch的标准KPM格式实现加载和控制
++ */
++
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/kernfs.h>
++#include <linux/file.h>
++#include <linux/vmalloc.h>
++#include <linux/uaccess.h>
++#include <linux/elf.h>
++#include <linux/kallsyms.h>
++#include <linux/version.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/rcupdate.h>
++#include <asm/elf.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <asm/cacheflush.h>
++#include <linux/module.h>
++#include <linux/set_memory.h>
++#include <linux/export.h>
++#include <linux/slab.h>
++#include <asm/insn.h>
++#include <linux/kprobes.h>
++#include <linux/stacktrace.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) && defined(CONFIG_MODULES)
++#include <linux/moduleloader.h>
++#endif
++#include "kpm.h"
++#include "compact.h"
++#include "compat/kernel_compat.h"
++#include "uapi/supercall.h"
++
++#define KPM_NAME_LEN 32
++#define KPM_ARGS_LEN 1024
++
++#ifndef NO_OPTIMIZE
++#if defined(__GNUC__) && !defined(__clang__)
++#define NO_OPTIMIZE __attribute__((optimize("O0")))
++#elif defined(__clang__)
++#define NO_OPTIMIZE __attribute__((optnone))
++#else
++#define NO_OPTIMIZE
++#endif
++#endif
++
++noinline NO_OPTIMIZE void sukisu_kpm_load_module_path(const char *path, const char *args, void *ptr, int *result)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_load_module_path). "
++            "path=%s args=%s ptr=%p\n",
++            path, args, ptr);
++
++    __asm__ volatile("nop");
++}
++EXPORT_SYMBOL(sukisu_kpm_load_module_path);
++
++noinline NO_OPTIMIZE void sukisu_kpm_unload_module(const char *name, void *ptr, int *result)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_unload_module). "
++            "name=%s ptr=%p\n",
++            name, ptr);
++
++    __asm__ volatile("nop");
++}
++EXPORT_SYMBOL(sukisu_kpm_unload_module);
++
++noinline NO_OPTIMIZE void sukisu_kpm_num(int *result)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_num).\n");
++
++    __asm__ volatile("nop");
++}
++EXPORT_SYMBOL(sukisu_kpm_num);
++
++noinline NO_OPTIMIZE void sukisu_kpm_info(const char *name, char *buf, int bufferSize, int *size)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_info). "
++            "name=%s buffer=%p\n",
++            name, buf);
++
++    __asm__ volatile("nop");
++}
++EXPORT_SYMBOL(sukisu_kpm_info);
++
++noinline NO_OPTIMIZE void sukisu_kpm_list(void *out, int bufferSize, int *result)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_list). "
++            "buffer=%p size=%d\n",
++            out, bufferSize);
++}
++EXPORT_SYMBOL(sukisu_kpm_list);
++
++noinline NO_OPTIMIZE void sukisu_kpm_control(const char *name, const char *args, long arg_len, int *result)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_control). "
++            "name=%p args=%p arg_len=%ld\n",
++            name, args, arg_len);
++
++    __asm__ volatile("nop");
++}
++EXPORT_SYMBOL(sukisu_kpm_control);
++
++noinline NO_OPTIMIZE void sukisu_kpm_version(char *buf, int bufferSize)
++{
++    pr_info("kpm: Stub function called (sukisu_kpm_version). "
++            "buffer=%p\n",
++            buf);
++}
++EXPORT_SYMBOL(sukisu_kpm_version);
++
++noinline int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1, unsigned long arg2,
++                               unsigned long result_code)
++{
++    int res = -1;
++    if (control_code == KSU_KPM_LOAD) {
++        char kernel_load_path[256] = { 0 };
++        char kernel_args_buffer[256] = { 0 };
++
++        if (arg1 == 0) {
++            res = -EINVAL;
++            goto exit;
++        }
++
++        if (!ksu_access_ok(arg1, sizeof(kernel_load_path))) {
++            goto invalid_arg;
++        }
++
++        strncpy_from_user((char *)&kernel_load_path, (const char *)arg1, sizeof(kernel_load_path));
++
++        if (arg2 != 0) {
++            if (!ksu_access_ok(arg2, sizeof(kernel_args_buffer))) {
++                goto invalid_arg;
++            }
++
++            strncpy_from_user((char *)&kernel_args_buffer, (const char *)arg2, sizeof(kernel_args_buffer));
++        }
++
++        sukisu_kpm_load_module_path((const char *)&kernel_load_path, (const char *)&kernel_args_buffer, NULL, &res);
++    } else if (control_code == KSU_KPM_UNLOAD) {
++        char kernel_name_buffer[256] = { 0 };
++
++        if (arg1 == 0) {
++            res = -EINVAL;
++            goto exit;
++        }
++
++        if (!ksu_access_ok(arg1, sizeof(kernel_name_buffer))) {
++            goto invalid_arg;
++        }
++
++        strncpy_from_user((char *)&kernel_name_buffer, (const char *)arg1, sizeof(kernel_name_buffer));
++
++        sukisu_kpm_unload_module((const char *)&kernel_name_buffer, NULL, &res);
++    } else if (control_code == KSU_KPM_NUM) {
++        sukisu_kpm_num(&res);
++    } else if (control_code == KSU_KPM_INFO) {
++        char kernel_name_buffer[256] = { 0 };
++        char buf[256] = { 0 };
++        int size;
++
++        if (arg1 == 0 || arg2 == 0) {
++            res = -EINVAL;
++            goto exit;
++        }
++
++        if (!ksu_access_ok(arg1, sizeof(kernel_name_buffer))) {
++            goto invalid_arg;
++        }
++
++        strncpy_from_user((char *)&kernel_name_buffer, (const char __user *)arg1, sizeof(kernel_name_buffer));
++
++        sukisu_kpm_info((const char *)&kernel_name_buffer, (char *)&buf, sizeof(buf), &size);
++
++        if (!ksu_access_ok(arg2, size)) {
++            goto invalid_arg;
++        }
++
++        res = copy_to_user(arg2, &buf, size);
++
++    } else if (control_code == KSU_KPM_LIST) {
++        char buf[1024] = { 0 };
++        int len = (int)arg2;
++
++        if (len <= 0) {
++            res = -EINVAL;
++            goto exit;
++        }
++
++        if (!ksu_access_ok(arg2, len)) {
++            goto invalid_arg;
++        }
++
++        sukisu_kpm_list((char *)&buf, sizeof(buf), &res);
++
++        if (res > len) {
++            res = -ENOBUFS;
++            goto exit;
++        }
++
++        if (copy_to_user(arg1, &buf, len) != 0)
++            pr_info("kpm: Copy to user failed.");
++
++    } else if (control_code == KSU_KPM_CONTROL) {
++        char kpm_name[KPM_NAME_LEN] = { 0 };
++        char kpm_args[KPM_ARGS_LEN] = { 0 };
++
++        if (!ksu_access_ok(arg1, sizeof(kpm_name))) {
++            goto invalid_arg;
++        }
++
++        if (!ksu_access_ok(arg2, sizeof(kpm_args))) {
++            goto invalid_arg;
++        }
++
++        long name_len = strncpy_from_user((char *)&kpm_name, (const char __user *)arg1, sizeof(kpm_name));
++        if (name_len <= 0) {
++            res = -EINVAL;
++            goto exit;
++        }
++
++        long arg_len = strncpy_from_user((char *)&kpm_args, (const char __user *)arg2, sizeof(kpm_args));
++
++        sukisu_kpm_control((const char *)&kpm_name, (const char *)&kpm_args, arg_len, &res);
++
++    } else if (control_code == KSU_KPM_VERSION) {
++        char buffer[256] = { 0 };
++
++        sukisu_kpm_version((char *)&buffer, sizeof(buffer));
++
++        unsigned int outlen = (unsigned int)arg2;
++        int len = strlen(buffer);
++        if (len >= outlen)
++            len = outlen - 1;
++
++        res = copy_to_user(arg1, &buffer, len + 1);
++    }
++
++exit:
++    if (copy_to_user(result_code, &res, sizeof(res)) != 0)
++        pr_info("kpm: Copy to user failed.");
++
++    return 0;
++invalid_arg:
++    pr_err("kpm: invalid pointer detected! arg1: %px arg2: %px\n", (void *)arg1, (void *)arg2);
++    res = -EFAULT;
++    goto exit;
++}
++EXPORT_SYMBOL(sukisu_handle_kpm);
++
++int sukisu_is_kpm_control_code(unsigned long control_code)
++{
++    return (control_code >= CMD_KPM_CONTROL && control_code <= CMD_KPM_CONTROL_MAX) ? 1 : 0;
++}
++
++int do_kpm(void __user *arg)
++{
++    struct ksu_kpm_cmd cmd;
++
++    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
++        pr_err("kpm: copy_from_user failed\n");
++        return -EFAULT;
++    }
++
++    if (!ksu_access_ok(cmd.control_code, sizeof(int))) {
++        pr_err("kpm: invalid control_code pointer %px\n", (void *)cmd.control_code);
++        return -EFAULT;
++    }
++
++    if (!ksu_access_ok(cmd.result_code, sizeof(int))) {
++        pr_err("kpm: invalid result_code pointer %px\n", (void *)cmd.result_code);
++        return -EFAULT;
++    }
++
++    return sukisu_handle_kpm(cmd.control_code, cmd.arg1, cmd.arg2, cmd.result_code);
++}
+diff --git a/kernel/kpm/kpm.h b/kernel/kpm/kpm.h
+new file mode 100644
+index 0000000..a5c43fb
+--- /dev/null
++++ b/kernel/kpm/kpm.h
+@@ -0,0 +1,15 @@
++#ifndef __SUKISU_KPM_H
++#define __SUKISU_KPM_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++int sukisu_handle_kpm(unsigned long control_code, unsigned long arg1, unsigned long arg2, unsigned long result_code);
++int sukisu_is_kpm_control_code(unsigned long control_code);
++int do_kpm(void __user *arg);
++
++/* KPM Control Code */
++#define CMD_KPM_CONTROL 1
++#define CMD_KPM_CONTROL_MAX 10
++
++#endif
+diff --git a/kernel/kpm/super_access.c b/kernel/kpm/super_access.c
+new file mode 100644
+index 0000000..8dc5ab2
+--- /dev/null
++++ b/kernel/kpm/super_access.c
+@@ -0,0 +1,278 @@
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/kernfs.h>
++#include <linux/file.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/uaccess.h>
++#include <linux/elf.h>
++#include <linux/kallsyms.h>
++#include <linux/version.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/rcupdate.h>
++#include <asm/elf.h>
++#include <linux/vmalloc.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <asm/cacheflush.h>
++#include <linux/module.h>
++#include <linux/vmalloc.h>
++#include <linux/set_memory.h>
++#include <linux/version.h>
++#include <linux/export.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/stddef.h>
++#include <linux/mount.h>
++#include <linux/kprobes.h>
++#include <linux/mm_types.h>
++#include <linux/netlink.h>
++#include <linux/sched.h>
++#include <../fs/mount.h>
++#include "kpm.h"
++#include "compact.h"
++
++struct DynamicStructMember {
++    const char *name;
++    size_t size;
++    size_t offset;
++};
++
++struct DynamicStructInfo {
++    const char *name;
++    size_t count;
++    size_t total_size;
++    struct DynamicStructMember *members;
++};
++
++#define DYNAMIC_STRUCT_BEGIN(struct_name) static struct DynamicStructMember struct_name##_members[] = {
++#define DEFINE_MEMBER(struct_name, member)                                                                             \
++    { .name = #member,                                                                                                 \
++      .size = sizeof(((struct struct_name *)0)->member),                                                               \
++      .offset = offsetof(struct struct_name, member) },
++
++#define DYNAMIC_STRUCT_END(struct_name)                                                                                \
++    }                                                                                                                  \
++    ;                                                                                                                  \
++    static struct DynamicStructInfo struct_name##_info = { .name = #struct_name,                                       \
++                                                           .count = sizeof(struct_name##_members) /                    \
++                                                                    sizeof(struct DynamicStructMember),                \
++                                                           .total_size = sizeof(struct struct_name),                   \
++                                                           .members = struct_name##_members };
++
++DYNAMIC_STRUCT_BEGIN(mount)
++DEFINE_MEMBER(mount, mnt_parent)
++DEFINE_MEMBER(mount, mnt)
++DEFINE_MEMBER(mount, mnt_id)
++DEFINE_MEMBER(mount, mnt_group_id)
++DEFINE_MEMBER(mount, mnt_expiry_mark)
++DEFINE_MEMBER(mount, mnt_master)
++DEFINE_MEMBER(mount, mnt_devname)
++DYNAMIC_STRUCT_END(mount)
++
++DYNAMIC_STRUCT_BEGIN(vfsmount)
++DEFINE_MEMBER(vfsmount, mnt_root)
++DEFINE_MEMBER(vfsmount, mnt_sb)
++DEFINE_MEMBER(vfsmount, mnt_flags)
++DYNAMIC_STRUCT_END(vfsmount)
++
++DYNAMIC_STRUCT_BEGIN(mnt_namespace)
++DEFINE_MEMBER(mnt_namespace, ns)
++DEFINE_MEMBER(mnt_namespace, root)
++DEFINE_MEMBER(mnt_namespace, seq)
++DEFINE_MEMBER(mnt_namespace, mounts)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
++DEFINE_MEMBER(mnt_namespace, count)
++#endif
++DYNAMIC_STRUCT_END(mnt_namespace)
++
++#ifdef CONFIG_KPROBES
++DYNAMIC_STRUCT_BEGIN(kprobe)
++DEFINE_MEMBER(kprobe, addr)
++DEFINE_MEMBER(kprobe, symbol_name)
++DEFINE_MEMBER(kprobe, offset)
++DEFINE_MEMBER(kprobe, pre_handler)
++DEFINE_MEMBER(kprobe, post_handler)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
++DEFINE_MEMBER(kprobe, fault_handler)
++#endif
++DEFINE_MEMBER(kprobe, flags)
++DYNAMIC_STRUCT_END(kprobe)
++#endif
++
++DYNAMIC_STRUCT_BEGIN(vm_area_struct)
++DEFINE_MEMBER(vm_area_struct, vm_start)
++DEFINE_MEMBER(vm_area_struct, vm_end)
++DEFINE_MEMBER(vm_area_struct, vm_flags)
++DEFINE_MEMBER(vm_area_struct, anon_vma)
++DEFINE_MEMBER(vm_area_struct, vm_pgoff)
++DEFINE_MEMBER(vm_area_struct, vm_file)
++DEFINE_MEMBER(vm_area_struct, vm_private_data)
++#ifdef CONFIG_ANON_VMA_NAME
++DEFINE_MEMBER(vm_area_struct, anon_name)
++#endif
++DEFINE_MEMBER(vm_area_struct, vm_ops)
++DYNAMIC_STRUCT_END(vm_area_struct)
++
++DYNAMIC_STRUCT_BEGIN(vm_operations_struct)
++DEFINE_MEMBER(vm_operations_struct, open)
++DEFINE_MEMBER(vm_operations_struct, close)
++DEFINE_MEMBER(vm_operations_struct, name)
++DEFINE_MEMBER(vm_operations_struct, access)
++DYNAMIC_STRUCT_END(vm_operations_struct)
++
++DYNAMIC_STRUCT_BEGIN(netlink_kernel_cfg)
++DEFINE_MEMBER(netlink_kernel_cfg, groups)
++DEFINE_MEMBER(netlink_kernel_cfg, flags)
++DEFINE_MEMBER(netlink_kernel_cfg, input)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++DEFINE_MEMBER(netlink_kernel_cfg, cb_mutex)
++#endif
++DEFINE_MEMBER(netlink_kernel_cfg, bind)
++DEFINE_MEMBER(netlink_kernel_cfg, unbind)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
++DEFINE_MEMBER(netlink_kernel_cfg, compare)
++#endif
++DYNAMIC_STRUCT_END(netlink_kernel_cfg)
++
++DYNAMIC_STRUCT_BEGIN(task_struct)
++DEFINE_MEMBER(task_struct, pid)
++DEFINE_MEMBER(task_struct, tgid)
++DEFINE_MEMBER(task_struct, cred)
++DEFINE_MEMBER(task_struct, real_cred)
++DEFINE_MEMBER(task_struct, comm)
++DEFINE_MEMBER(task_struct, parent)
++DEFINE_MEMBER(task_struct, group_leader)
++DEFINE_MEMBER(task_struct, mm)
++DEFINE_MEMBER(task_struct, active_mm)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
++DEFINE_MEMBER(task_struct, pids[PIDTYPE_PID].pid)
++#else
++DEFINE_MEMBER(task_struct, thread_pid)
++#endif
++DEFINE_MEMBER(task_struct, files)
++DEFINE_MEMBER(task_struct, seccomp)
++#ifdef CONFIG_THREAD_INFO_IN_TASK
++DEFINE_MEMBER(task_struct, thread_info)
++#endif
++#ifdef CONFIG_CGROUPS
++DEFINE_MEMBER(task_struct, cgroups)
++#endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
++#ifdef CONFIG_SECURITY
++DEFINE_MEMBER(task_struct, security)
++#endif
++#endif
++DEFINE_MEMBER(task_struct, thread)
++DYNAMIC_STRUCT_END(task_struct)
++
++#define STRUCT_INFO(name) &(name##_info)
++
++static struct DynamicStructInfo *dynamic_struct_infos[] = { STRUCT_INFO(mount),
++                                                            STRUCT_INFO(vfsmount),
++                                                            STRUCT_INFO(mnt_namespace),
++#ifdef CONFIG_KPROBES
++                                                            STRUCT_INFO(kprobe),
++#endif
++                                                            STRUCT_INFO(vm_area_struct),
++                                                            STRUCT_INFO(vm_operations_struct),
++                                                            STRUCT_INFO(netlink_kernel_cfg),
++                                                            STRUCT_INFO(task_struct) };
++
++/*
++ * return 0 if successful
++ * return -1 if struct not defined
++ */
++int sukisu_super_find_struct(const char *struct_name, size_t *out_size, int *out_members)
++{
++    size_t i; // for C89 standard or later
++    for (i = 0; i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0])); i++) {
++        struct DynamicStructInfo *info = dynamic_struct_infos[i];
++
++        if (strcmp(struct_name, info->name) == 0) {
++            if (out_size)
++                *out_size = info->total_size;
++
++            if (out_members)
++                *out_members = info->count;
++
++            return 0;
++        }
++    }
++
++    return -1;
++}
++EXPORT_SYMBOL(sukisu_super_find_struct);
++
++/*
++ * Dynamic access struct
++ * return 0 if successful
++ * return -1 if struct not defined
++ * return -2 if member not defined
++ */
++int sukisu_super_access(const char *struct_name, const char *member_name, size_t *out_offset, size_t *out_size)
++{
++    size_t i; // for C89 standard or later
++    for (i = 0; i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0])); i++) {
++        struct DynamicStructInfo *info = dynamic_struct_infos[i];
++
++        if (strcmp(struct_name, info->name) == 0) {
++            size_t i1; // for C89 standard or later
++            for (i1 = 0; i1 < info->count; i1++) {
++                if (strcmp(info->members[i1].name, member_name) == 0) {
++                    if (out_offset)
++                        *out_offset = info->members[i].offset;
++
++                    if (out_size)
++                        *out_size = info->members[i].size;
++
++                    return 0;
++                }
++            }
++
++            return -2;
++        }
++    }
++
++    return -1;
++}
++EXPORT_SYMBOL(sukisu_super_access);
++
++#define DYNAMIC_CONTAINER_OF(offset, member_ptr)                                                                       \
++    ({ (offset != (size_t) - 1) ? (void *)((char *)(member_ptr) - offset) : NULL; })
++
++/*
++ * Dynamic container_of
++ * return 0 if success
++ * return -1 if current struct not defined
++ * return -2 if target member not defined
++ */
++int sukisu_super_container_of(const char *struct_name, const char *member_name, void *ptr, void **out_ptr)
++{
++    if (ptr == NULL)
++        return -3;
++
++    size_t i; // for C89 standard or later
++    for (i = 0; i < (sizeof(dynamic_struct_infos) / sizeof(dynamic_struct_infos[0])); i++) {
++        struct DynamicStructInfo *info = dynamic_struct_infos[i];
++
++        if (strcmp(struct_name, info->name) == 0) {
++            size_t i1; // for C89 standard or later
++            for (i1 = 0; i1 < info->count; i1++) {
++                if (strcmp(info->members[i1].name, member_name) == 0) {
++                    *out_ptr = (void *)DYNAMIC_CONTAINER_OF(info->members[i1].offset, ptr);
++
++                    return 0;
++                }
++            }
++
++            return -2;
++        }
++    }
++
++    return -1;
++}
++EXPORT_SYMBOL(sukisu_super_container_of);
+diff --git a/kernel/kpm/super_access.h b/kernel/kpm/super_access.h
+new file mode 100644
+index 0000000..a550045
+--- /dev/null
++++ b/kernel/kpm/super_access.h
+@@ -0,0 +1,13 @@
++#ifndef __SUKISU_SUPER_ACCESS_H
++#define __SUKISU_SUPER_ACCESS_H
++
++#include <linux/types.h>
++#include <linux/stddef.h>
++#include "kpm.h"
++#include "compact.h"
++
++extern int sukisu_super_find_struct(const char *struct_name, size_t *out_size, int *out_members);
++extern int sukisu_super_access(const char *struct_name, const char *member_name, size_t *out_offset, size_t *out_size);
++extern int sukisu_super_container_of(const char *struct_name, const char *member_name, void *ptr, void **out_ptr);
++
++#endif
+\ No newline at end of file
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index 1edc064..8959834 100644
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -27,6 +27,9 @@
+ #endif
+ #include "feature/dynamic_manager.h"
+ #include "policy/app_profile.h"
++#ifdef CONFIG_KPM
++#include "kpm/kpm.h"
++#endif
+ 
+ #ifdef CONFIG_KSU_TOOLKIT_SUPPORT
+ #include <linux/utsname.h> // utsname() and uts_sem
+@@ -919,6 +922,21 @@ static int do_get_hook_type(void __user *arg)
+     return 0;
+ }
+ 
++// 102. ENABLE_KPM - Check if KPM is enabled
++static int do_enable_kpm(void __user *arg)
++{
++    struct ksu_enable_kpm_cmd cmd;
++
++    cmd.enabled = IS_ENABLED(CONFIG_KPM);
++
++    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
++        pr_err("enable_kpm: copy_to_user failed\n");
++        return -EFAULT;
++    }
++
++    return 0;
++}
++
+ static int do_dynamic_manager(void __user *arg)
+ {
+ #ifdef CONFIG_KSU_DISABLE_MANAGER
+@@ -1357,6 +1375,12 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
+         .handler = do_get_hook_type, 
+         .perm_check = manager_or_root 
+     },
++    { 
++        .cmd = KSU_IOCTL_ENABLE_KPM, 
++        .name = "GET_ENABLE_KPM", 
++        .handler = do_enable_kpm, 
++        .perm_check = manager_or_root 
++    },
+     { 
+         .cmd = KSU_IOCTL_DYNAMIC_MANAGER,
+         .name = "SET_DYNAMIC_MANAGER",
+@@ -1375,6 +1399,14 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
+         .handler = do_get_kernel_patch_implement, 
+         .perm_check = manager_or_root 
+     },
++#ifdef CONFIG_KPM
++    { 
++        .cmd = KSU_IOCTL_KPM, 
++        .name = "KPM_OPERATION", 
++        .handler = do_kpm, 
++        .perm_check = manager_or_root 
++    },
++#endif
+     { 
+         .cmd = 0, 
+         .name = NULL, 
+diff --git a/uapi/supercall.h b/uapi/supercall.h
+index 25ab797..52ed74d 100644
+--- a/uapi/supercall.h
++++ b/uapi/supercall.h
+@@ -175,6 +175,10 @@ struct ksu_hook_type_cmd {
+     char hook_type[32]; // Output: hook type string
+ };
+ 
++struct ksu_enable_kpm_cmd {
++    __u8 enabled; // Output: true if KPM is enabled
++};
++
+ DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_SET, 0)
+ DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_GET, 1)
+ DEFINE_KSU_UAPI_CONST(__u8, DYNAMIC_MANAGER_OP_WIPE, 2)
+@@ -197,6 +201,21 @@ struct ksu_get_managers_cmd {
+     struct ksu_manager_entry managers[]; // Output: Array of active manager
+ } __attribute__((packed));
+ 
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_LOAD, 1)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_UNLOAD, 2)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_NUM, 3)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_LIST, 4)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_INFO, 5)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_CONTROL, 6)
++DEFINE_KSU_UAPI_CONST(__u8, KSU_KPM_VERSION, 7)
++
++struct ksu_kpm_cmd {
++    __u8 __user control_code;
++    __aligned_u64 __user arg1;
++    __aligned_u64 __user arg2;
++    __aligned_u64 __user result_code;
++} __attribute__((packed));
++
+ DEFINE_KSU_UAPI_CONST(__u8, KERNEL_PATCH_NOT_FOUND, 0)
+ DEFINE_KSU_UAPI_CONST(__u8, KERNEL_PATCH_ORIGINAL, 1)
+ DEFINE_KSU_UAPI_CONST(__u8, KERNEL_PATCH_KPN, 2)
+@@ -238,11 +257,12 @@ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, _IO('K', 21))
+ // Downstream add IOCTL command definitions
+ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_FULL_VERSION, _IOC(_IOC_READ, 'K', 100, 0))
+ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_HOOK_TYPE, _IOC(_IOC_READ, 'K', 101, 0))
+-// 102 = ENABLE_KPM (KernelPatch Module),deprecated
++DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_ENABLE_KPM, _IOC(_IOC_READ, 'K', 102, 0))
+ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_DYNAMIC_MANAGER, _IOC(_IOC_READ | _IOC_WRITE, 'K', 103, 0))
+ // 104 = old get_managers, deprecated
+ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_MANAGERS, _IOC(_IOC_READ | _IOC_WRITE, 'K', 105, 0))
+ DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_GET_KERNEL_PATCH_IMPLEMENT, _IOC(_IOC_READ, 'K', 106, 0))
+-// 200 = MANAGE_KPM,deprecated
++DEFINE_KSU_UAPI_CONST(__u32, KSU_IOCTL_KPM, _IOC(_IOC_READ | _IOC_WRITE, 'K', 200, 0))
++
+ #undef DEFINE_KSU_UAPI_CONST
+ #endif
