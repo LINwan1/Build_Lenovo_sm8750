@@ -1,0 +1,184 @@
+name: Build KPM Manager (ReSukiSU a13d71f6)
+
+# 用途：构建「原生支持 KPM」的 ReSukiSU 管理器 APK 与 ksud 二进制。
+#
+# 背景：ReSukiSU 在提交 faac3098 移除了 KPM 支持，其父提交 a13d71f6 是最后一个
+#       内核 + ksud + 管理器三层齐全的版本。官方 release（v4.2.0-rc1/rc2）都在其后，
+#       不含 KPM UI，所以必须从 a13d71f6 源码自建管理器。
+#
+# 产物：
+#   ksud-a13d71f6-aarch64   —— ksud 二进制（可 adb push 到 /data/adb/ksud）
+#   KPM-Manager-APK         —— 含 KPM 页面的管理器 APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      rsksu_ref:
+        description: "ReSukiSU ref (commit sha / tag)"
+        required: false
+        default: "a13d71f699093f0c1da7ba442881eccaa8e4321a"
+        type: string
+
+env:
+  RSKSU_REF: ${{ github.event.inputs.rsksu_ref }}
+  NDK_VERSION: "29.0.14206865"
+  BUILD_TOOLS: "36.1.0"
+  COMPILE_SDK: "37"
+
+jobs:
+  # ------------------------------------------------------------------ ksud
+  build-ksud:
+    name: Build ksud (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ReSukiSU
+        uses: actions/checkout@v5
+        with:
+          repository: ReSukiSU/ReSukiSU
+          ref: ${{ env.RSKSU_REF }}
+          fetch-depth: 0
+          fetch-tags: true
+          path: rsksu
+
+      - name: Verify KPM (ksud side)
+        working-directory: rsksu
+        run: |
+          echo "== ReSukiSU commit: $(git rev-parse HEAD)"
+          test -f userspace/ksud/src/android/kpm.rs \
+            || { echo "::error::ksud 缺少 src/android/kpm.rs —— 该 ref 不含 KPM 支持"; exit 1; }
+          echo "  ✓ ksud 侧 KPM 模块存在 (kpm.rs)"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          targets: aarch64-linux-android
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: kpm-ksud-a13d71f6
+          workspaces: rsksu/userspace/ksud
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build ksud
+        working-directory: rsksu/userspace/ksud
+        run: |
+          set -x
+          ls -la src/lkm_image_bootstrap.S || true
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o .lkm_image_bootstrap.o src/lkm_image_bootstrap.S || \
+            echo "::warning::lkm_image_bootstrap.o 编译失败（LKM 内嵌可能不可用，不影响 KPM）"
+          cargo ndk b -P 26 -t aarch64-linux-android -r
+          ls -la target/aarch64-linux-android/release/ksud
+
+      - name: Upload ksud
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksud-a13d71f6-aarch64
+          path: rsksu/userspace/ksud/target/aarch64-linux-android/release/ksud
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- manager
+  build-manager:
+    name: Build KPM Manager APK
+    needs: build-ksud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ReSukiSU
+        uses: actions/checkout@v5
+        with:
+          repository: ReSukiSU/ReSukiSU
+          ref: ${{ env.RSKSU_REF }}
+          fetch-depth: 0
+          fetch-tags: true
+          path: rsksu
+
+      - name: Verify KPM (manager side)
+        working-directory: rsksu
+        run: |
+          find manager -iname 'Kpm*.kt' -print
+          test -n "$(find manager -iname 'KpmPage.kt' -print -quit)" \
+            || { echo "::error::管理器缺少 KpmPage.kt —— 该 ref 不含 KPM UI"; exit 1; }
+          echo "  ✓ 管理器 KPM 页面存在"
+
+      - name: Download ksud artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ksud-a13d71f6-aarch64
+          path: rsksu/userspace/ksud/target/aarch64-linux-android/release
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-${COMPILE_SDK}" \
+                     "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare temp signing key
+        id: sign
+        working-directory: rsksu/manager
+        run: |
+          KS_PASS=$(openssl rand -hex 16)
+          keytool -genkeypair -alias kpm-key -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KS_PASS" -keypass "$KS_PASS" \
+            -dname "CN=KPM Manager Build" -storetype JKS -keystore key.jks
+          {
+            echo "KEYSTORE_PASSWORD=$KS_PASS"
+            echo "KEY_ALIAS=kpm-key"
+            echo "KEY_PASSWORD=$KS_PASS"
+            echo "KEYSTORE_FILE=key.jks"
+          } >> gradle.properties
+          echo "pass=$KS_PASS" >> $GITHUB_OUTPUT
+          echo "  ✓ 已生成临时签名密钥"
+
+      - name: Build APK (gradle)
+        working-directory: rsksu/manager
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease -Pcommit=$(git -C .. rev-parse HEAD) --no-daemon
+          find app/build/outputs/apk -type f -name '*.apk' -exec ls -la {} \;
+
+      - name: Repack with ksud + sign
+        working-directory: rsksu
+        run: |
+          python3 repack_apk_multi.py repack \
+            -b release -t release -a arm64-v8a \
+            -K manager/key.jks -A kpm-key \
+            -P "${{ steps.sign.outputs.pass }}" \
+            -S "${{ steps.sign.outputs.pass }}" \
+            --strip
+          echo "=== dist ==="
+          ls -la dist/
+
+      - name: Upload Manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KPM-Manager-APK
+          path: rsksu/dist/*.apk
+          if-no-files-found: error
